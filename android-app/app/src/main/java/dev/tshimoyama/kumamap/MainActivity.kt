@@ -21,8 +21,7 @@ import androidx.core.content.ContextCompat
  */
 class MainActivity : AppCompatActivity() {
 
-    // TODO: GitHub Pages公開後、実際のURLに差し替える (例: https://<user>.github.io/<repo>/)
-    private val remoteUrl = "https://REPLACE_ME.github.io/kuma-map/"
+    private val remoteUrl = "https://undermt.github.io/kuma-map/"
     private val localFallbackUrl = "file:///android_asset/index.html"
 
     private lateinit var webView: WebView
