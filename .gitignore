@@ -1,0 +1,11 @@
+# Android
+android-app/.gradle/
+android-app/.idea/
+android-app/local.properties
+android-app/**/build/
+android-app/**/*.iml
+android-app/captures/
+
+# Python
+data-pipeline/__pycache__/
+data-pipeline/*.pyc

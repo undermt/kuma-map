@@ -1,0 +1,6 @@
+<resources>
+    <style name="Theme.KumaMap" parent="Theme.AppCompat.DayNight.NoActionBar">
+        <item name="android:statusBarColor">#7A3E1D</item>
+        <item name="android:windowBackground">#F4F1EC</item>
+    </style>
+</resources>
