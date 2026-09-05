@@ -40,6 +40,8 @@ KML_NS = "{http://www.opengis.net/kml/2.2}"
 
 SHIZUOKA_KML_URL = "https://www.google.com/maps/d/kml?mid=1o_iXJ5z-tA9bTd8k2DMFPLO9BS4LRDI&forcekml=1"
 OTSU_KML_URL = "https://www.google.com/maps/d/kml?mid=1rE5HcSdJnm2gX3iT1FMt0aCVuQ9ArDs&forcekml=1"
+TAKASHIMA_KML_URL = "https://www.google.com/maps/d/kml?mid=1a0DGKSOSsgTAhxmq-M-UCvAWY1YGN2g&forcekml=1"
+RITTO_URL = "https://www.city.ritto.lg.jp/soshiki/kankyokeizai/norin/oshirase/15732.html"
 GIFU_CKAN_API = "https://gifu-opendata.pref.gifu.lg.jp/api/3/action/package_show?id=c11265-010"
 
 # 岐阜県オープンデータの平面直角座標系(第Ⅶ系, JGD2011)→ 緯度経度(JGD2011)変換
@@ -202,6 +204,112 @@ def fetch_otsu() -> list[Sighting]:
     return results
 
 
+_TAKASHIMA_NAME_RE = re.compile(
+    r"^R(?P<reiwa>\d+)\.(?P<month>\d{1,2})\.(?P<day>\d{1,2})"
+    r"[\s　]*"
+    r"(?:(?P<hour>\d{1,2})[:：](?P<minute>\d{2}))?"
+    r"[\s　]*(?P<note>.*)$"
+)
+
+
+def fetch_takashima() -> list[Sighting]:
+    resp = requests.get(TAKASHIMA_KML_URL, headers=HEADERS, timeout=30)
+    resp.raise_for_status()
+    root = ET.fromstring(resp.content)
+
+    results: list[Sighting] = []
+    for placemark in root.iter(f"{KML_NS}Placemark"):
+        raw_name = (placemark.findtext(f"{KML_NS}name") or "").strip()
+        raw_name = re.sub(r"[\s　]+", " ", raw_name)
+        nm = _TAKASHIMA_NAME_RE.match(raw_name)
+        if not nm:
+            continue  # 「市町境界」などクマ目撃地点以外のPlacemarkを除外
+
+        coords_text = placemark.findtext(f"{KML_NS}Point/{KML_NS}coordinates")
+        if not coords_text:
+            continue
+        parts = coords_text.strip().split(",")
+        if len(parts) < 2:
+            continue
+        lon, lat = float(parts[0]), float(parts[1])
+
+        year = 2018 + int(nm.group("reiwa"))
+        month, day = int(nm.group("month")), int(nm.group("day"))
+        date_iso = f"{year:04d}-{month:02d}-{day:02d}"
+        time_str = f"{int(nm.group('hour')):02d}:{nm.group('minute')}" if nm.group("hour") else None
+        note = (nm.group("note") or "").strip() or None  # 「痕跡」「樹皮剥ぎ」等の時刻代わりの状態表記
+
+        results.append(
+            Sighting(
+                prefecture="滋賀県",
+                city="高島市",
+                place=(placemark.findtext(f"{KML_NS}description") or "").strip() or None,
+                date=date_iso,
+                time=time_str,
+                count=None,
+                note=note,
+                source="高島市 クマ出没マップ (https://www.city.takashima.lg.jp/shigoto_sangyo/sangyo_nogyo_shinringyo_suisangyo/2/4/5193.html)",
+                lon=lon,
+                lat=lat,
+            )
+        )
+    return results
+
+
+def fetch_ritto() -> list[Sighting]:
+    resp = requests.get(RITTO_URL, headers=HEADERS, timeout=30)
+    resp.raise_for_status()
+    html = resp.content.decode("utf-8", errors="ignore")
+
+    results: list[Sighting] = []
+    for block in re.split(r"<h2>", html)[1:]:
+        heading_m = re.search(r"令和(\d+)年(\d{1,2})月(\d{1,2})日", block)
+        if not heading_m:
+            continue
+
+        # 座標リンクが無いブロックは訂正情報・他所管の告知等のため対象外
+        map_m = re.search(r'<div class="gmap">.*?q=([\d.]+),([\d.]+)', block, re.S)
+        if not map_m:
+            continue
+        lat, lon = float(map_m.group(1)), float(map_m.group(2))
+
+        body_m = re.search(r'<div class="wysiwyg">\s*<p>(.*?)</p>', block, re.S)
+        body = re.sub(r"<[^>]+>", "", body_m.group(1)) if body_m else ""
+
+        reiwa, month, day = (int(g) for g in heading_m.groups())
+        date_iso = f"{2018 + reiwa:04d}-{month:02d}-{day:02d}"
+
+        time_m = re.search(r"(\d{1,2})時(?:(\d{1,2})分)?頃", body)
+        time_str = (
+            f"{int(time_m.group(1)):02d}:{int(time_m.group(2) or 0):02d}" if time_m else None
+        )
+
+        # 座標リンク付きで残るのは栗東市自身の目撃情報のみ(他市町の告知は座標リンクが無く既に除外済み)
+        city = "栗東市"
+        place_m = re.search(r"栗東市([^(（]*)地先(?:[(（]([^)）]*)[)）])?", body)
+        place = (place_m.group(1).strip() if place_m else "") or None
+        detail = place_m.group(2).strip() if place_m and place_m.group(2) else None
+
+        count_m = re.search(r"(\d+)頭", body)
+        count = int(count_m.group(1)) if count_m else None
+
+        results.append(
+            Sighting(
+                prefecture="滋賀県",
+                city=city,
+                place=place,
+                date=date_iso,
+                time=time_str,
+                count=count,
+                note=detail,
+                source="栗東市 クマ目撃情報 (https://www.city.ritto.lg.jp/soshiki/kankyokeizai/norin/oshirase/15732.html)",
+                lon=lon,
+                lat=lat,
+            )
+        )
+    return results
+
+
 def _gifu_latest_zip_url() -> tuple[str, int]:
     """CKAN APIから最新年度のZIPリソースURLと令和年度番号を取得"""
     resp = requests.get(GIFU_CKAN_API, headers=HEADERS, timeout=30)
@@ -285,6 +393,8 @@ def main() -> None:
     fetchers = [
         ("静岡県", fetch_shizuoka),
         ("滋賀県(大津市)", fetch_otsu),
+        ("滋賀県(高島市)", fetch_takashima),
+        ("滋賀県(栗東市)", fetch_ritto),
         ("岐阜県", fetch_gifu),
     ]
     for label, fn in fetchers:
