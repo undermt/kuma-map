@@ -72,6 +72,18 @@
   .popup-content .note { margin-top: 4px; padding-top: 4px; border-top: 1px dashed var(--border); color: #4a3f36; }
   .popup-content .source { margin-top: 6px; font-size: 10px; color: var(--text-muted); word-break: break-all; }
 
+  .marker-recent-wrap { position: relative; overflow: visible !important; }
+  .marker-recent-pulse {
+    position: absolute; top: 50%; left: 50%;
+    width: 22px; height: 22px; margin: -11px 0 0 -11px;
+    border-radius: 50%; background: rgba(230,57,70,0.55);
+    animation: recent-pulse 1.6s ease-out infinite;
+  }
+  @keyframes recent-pulse {
+    0% { transform: scale(0.6); opacity: 0.9; }
+    100% { transform: scale(2.4); opacity: 0; }
+  }
+
   #loading {
     position: absolute; inset: 0; z-index: 2000; background: var(--bg);
     display: flex; align-items: center; justify-content: center; flex-direction: column; gap: 10px;
@@ -106,7 +118,7 @@
 <div id="locate-btn" title="現在地を表示">📍</div>
 
 <div id="info-panel">
-  最終更新: <b id="generated-at">-</b><br>
+  最終更新: <b id="generated-at">-</b> / <span style="color:#e63946;font-weight:700;">●</span> 点滅マーカー = 直近3ヶ月以内の目撃<br>
   出典: 静岡県・岐阜県オープンデータ、大津市公開マップ。岐阜県は年度単位更新のため最新出没から反映まで時間差があります。位置情報は各出典の精度に依存します。
 </div>
 
@@ -131,18 +143,38 @@ const clusterGroups = {
 };
 Object.values(clusterGroups).forEach(g => map.addLayer(g));
 
+const RECENT_DAYS = 90;
+
+function isRecentDate(dateStr) {
+  if (!dateStr) return false;
+  const d = new Date(dateStr + 'T00:00:00');
+  if (isNaN(d.getTime())) return false;
+  const diffDays = (Date.now() - d.getTime()) / 86400000;
+  return diffDays >= 0 && diffDays <= RECENT_DAYS;
+}
+
 function makeClusterIcon(color) {
   return function (cluster) {
     const count = cluster.getChildCount();
+    const hasRecent = cluster.getAllChildMarkers().some(m => m.options.isRecent);
     const size = count < 10 ? 30 : count < 50 ? 38 : 46;
+    const ring = hasRecent ? 'border:3px solid #e63946;box-shadow:0 0 0 3px rgba(230,57,70,0.35);' : 'border:2px solid #fff;box-shadow:0 1px 4px rgba(0,0,0,0.3);';
     return L.divIcon({
-      html: `<div style="background:${color};width:${size}px;height:${size}px;border-radius:50%;display:flex;align-items:center;justify-content:center;color:#fff;font-weight:700;font-size:12px;border:2px solid #fff;box-shadow:0 1px 4px rgba(0,0,0,0.3);">${count}</div>`,
+      html: `<div style="background:${color};width:${size}px;height:${size}px;border-radius:50%;display:flex;align-items:center;justify-content:center;color:#fff;font-weight:700;font-size:12px;${ring}">${count}</div>`,
       className: '', iconSize: L.point(size, size)
     });
   };
 }
 
-function makeDotIcon(color) {
+function makeDotIcon(color, isRecent) {
+  if (isRecent) {
+    return L.divIcon({
+      html: `
+        <div class="marker-recent-pulse"></div>
+        <div style="position:relative;background:${color};width:22px;height:22px;border-radius:50% 50% 50% 0;transform:rotate(45deg);border:2.5px solid #e63946;box-shadow:0 1px 4px rgba(0,0,0,0.5);"></div>`,
+      className: 'marker-recent-wrap', iconSize: [22, 22], iconAnchor: [11, 22]
+    });
+  }
   return L.divIcon({
     html: `<div style="background:${color};width:16px;height:16px;border-radius:50% 50% 50% 0;transform:rotate(45deg);border:2px solid #fff;box-shadow:0 1px 3px rgba(0,0,0,0.4);"></div>`,
     className: '', iconSize: [16, 16], iconAnchor: [8, 16]
@@ -157,9 +189,10 @@ function escapeHtml(s) {
 function popupHtml(p) {
   const color = PREF_COLOR[p.prefecture] || '#666';
   const dateLine = [p.date, p.time].filter(Boolean).join(' ');
+  const recentBadge = isRecentDate(p.date) ? `<span class="pref" style="background:#e63946;margin-left:4px;">直近3ヶ月</span>` : '';
   return `
     <div class="popup-content">
-      <span class="pref" style="background:${color}">${escapeHtml(p.prefecture)}</span>
+      <span class="pref" style="background:${color}">${escapeHtml(p.prefecture)}</span>${recentBadge}
       <div class="row"><span class="label">日時:</span><span>${escapeHtml(dateLine) || '不明'}</span></div>
       <div class="row"><span class="label">場所:</span><span>${escapeHtml(p.city)} ${escapeHtml(p.place)}</span></div>
       ${p.count ? `<div class="row"><span class="label">頭数:</span><span>${escapeHtml(p.count)}頭</span></div>` : ''}
@@ -180,7 +213,12 @@ fetch('./data.geojson', { cache: 'no-store' })
     allFeatures.forEach(f => {
       const p = f.properties;
       const [lon, lat] = f.geometry.coordinates;
-      const marker = L.marker([lat, lon], { icon: makeDotIcon(PREF_COLOR[p.prefecture] || '#666') });
+      const recent = isRecentDate(p.date);
+      const marker = L.marker([lat, lon], {
+        icon: makeDotIcon(PREF_COLOR[p.prefecture] || '#666', recent),
+        isRecent: recent,
+        zIndexOffset: recent ? 1000 : 0
+      });
       marker.bindPopup(popupHtml(p));
       const group = clusterGroups[p.prefecture];
       if (group) group.addLayer(marker);
