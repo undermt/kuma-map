@@ -78,13 +78,22 @@ def _parse_int(text: str | None) -> int | None:
 
 
 def _slash_date_to_iso(text: str | None) -> str | None:
-    """'2026/4/2' -> '2026-04-02'"""
+    """'2026/4/2' (Y/M/D) または '4/2/2025' (M/D/Y, 旧年度データに混在) -> '2026-04-02'"""
     if not text:
         return None
-    m = re.match(r"(\d{4})/(\d{1,2})/(\d{1,2})", text.strip())
-    if not m:
+    parts = text.strip().split("/")
+    if len(parts) != 3:
         return None
-    y, mo, d = (int(g) for g in m.groups())
+    try:
+        nums = [int(p) for p in parts]
+    except ValueError:
+        return None
+    if len(parts[0]) == 4:
+        y, mo, d = nums
+    elif len(parts[2]) == 4:
+        mo, d, y = nums
+    else:
+        return None
     return f"{y:04d}-{mo:02d}-{d:02d}"
 
 
