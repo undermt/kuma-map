@@ -9,3 +9,4 @@ android-app/captures/
 # Python
 data-pipeline/__pycache__/
 data-pipeline/*.pyc
+.claude/

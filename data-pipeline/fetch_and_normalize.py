@@ -1,5 +1,5 @@
 """
-クマ出没情報の収集・正規化パイプライン (MVP: 静岡県, 岐阜県, 滋賀県大津市)
+クマ出没情報の収集・正規化パイプライン (静岡県, 岐阜県, 滋賀県, 山梨県, 奈良県 ほか)
 
 各県のデータを取得し、共通スキーマのGeoJSON (docs/data.geojson) にまとめて出力する。
 GitHub Pagesの /docs フォルダから配信し、Androidアプリ(WebView)はそのGeoJSONを読み込んで地図表示する想定。
@@ -10,11 +10,12 @@ GitHub Pagesの /docs フォルダから配信し、Androidアプリ(WebView)は
 """
 from __future__ import annotations
 
+import csv
 import io
 import re
 import zipfile
 from dataclasses import dataclass, asdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from xml.etree import ElementTree as ET
 
@@ -36,12 +37,23 @@ HEADERS = {
         "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
     )
 }
+JST = timezone(timedelta(hours=9))
 KML_NS = "{http://www.opengis.net/kml/2.2}"
 
 SHIZUOKA_KML_URL = "https://www.google.com/maps/d/kml?mid=1o_iXJ5z-tA9bTd8k2DMFPLO9BS4LRDI&forcekml=1"
 OTSU_KML_URL = "https://www.google.com/maps/d/kml?mid=1rE5HcSdJnm2gX3iT1FMt0aCVuQ9ArDs&forcekml=1"
 TAKASHIMA_KML_URL = "https://www.google.com/maps/d/kml?mid=1a0DGKSOSsgTAhxmq-M-UCvAWY1YGN2g&forcekml=1"
 RITTO_URL = "https://www.city.ritto.lg.jp/soshiki/kankyokeizai/norin/oshirase/15732.html"
+# 山梨県: やまなしデータプラットフォームのデータセットページからCSVのリンクを辿る(API申請不要の方式)
+# kuma0=直近1か月、kuma1=当年度(直近1か月を除く)。年度替わりでリソースIDが変わるため毎回ページから引く
+YAMANASHI_DATASET_PAGES = [
+    "https://catalog.dataplatform-yamanashi.jp/dataset/kuma1",
+    "https://catalog.dataplatform-yamanashi.jp/dataset/kuma0",
+]
+NARA_FEATURE_URL = (
+    "https://pub-gis.nsa.pref.nara.jp/server/rest/services/Hosted/"
+    "survey123_492ede82f5ae450ea7171fb986f04bd0/FeatureServer/0/query"
+)
 GIFU_CKAN_API = "https://gifu-opendata.pref.gifu.lg.jp/api/3/action/package_show?id=c11265-010"
 
 # 岐阜県オープンデータの平面直角座標系(第Ⅶ系, JGD2011)→ 緯度経度(JGD2011)変換
@@ -388,6 +400,99 @@ def fetch_gifu() -> list[Sighting]:
     return results
 
 
+def _to_float(text) -> float | None:
+    try:
+        return float(text)
+    except (TypeError, ValueError):
+        return None
+
+
+def fetch_yamanashi() -> list[Sighting]:
+    results: list[Sighting] = []
+    seen_no: set[str] = set()
+    for page_url in YAMANASHI_DATASET_PAGES:
+        page = requests.get(page_url, headers=HEADERS, timeout=30)
+        page.raise_for_status()
+        links = sorted(set(re.findall(
+            r'https://catalog\.dataplatform-yamanashi\.jp/dataset/[^"]+/download/[^"]+\.csv', page.text
+        )))
+        if not links:
+            raise RuntimeError(f"CSVのリンクが見つかりません: {page_url}")
+        for link in links:
+            resp = requests.get(link, headers=HEADERS, timeout=30)
+            resp.raise_for_status()
+            reader = csv.DictReader(io.StringIO(resp.content.decode("utf-8-sig")))
+            for row in reader:
+                lat, lon = _to_float(row.get("緯度")), _to_float(row.get("経度"))
+                if lat is None or lon is None:
+                    continue
+                no = (row.get("No.") or "").strip()
+                if no and no in seen_no:
+                    continue
+                seen_no.add(no)
+                note_parts = [row.get(k, "").strip() for k in ("目撃時のクマ", "推定年齢") if row.get(k, "").strip()]
+                if (row.get("人身被害の有無") or "").strip() not in ("", "無し", "なし"):
+                    note_parts.append("人身被害: " + row["人身被害の有無"].strip())
+                results.append(
+                    Sighting(
+                        prefecture="山梨県",
+                        city=(row.get("目撃市町村") or "").strip() or None,
+                        place=(row.get("場所") or "").strip() or None,
+                        date=_slash_date_to_iso(row.get("年月日")),
+                        time=(row.get("時間") or "").strip() or None,
+                        count=_parse_int(row.get("目撃頭数")),
+                        note=" / ".join(note_parts) or None,
+                        source="山梨県 ツキノワグマ出没・目撃情報 (山梨県オープンデータ, https://www.pref.yamanashi.jp/shizen/kuma2.html)",
+                        lon=lon,
+                        lat=lat,
+                    )
+                )
+    return results
+
+
+def fetch_nara() -> list[Sighting]:
+    results: list[Sighting] = []
+    offset = 0
+    while True:
+        params = {
+            "where": "1=1", "outFields": "*", "outSR": "4326", "f": "geojson",
+            "orderByFields": "objectid", "resultOffset": offset, "resultRecordCount": 1000,
+        }
+        resp = requests.get(NARA_FEATURE_URL, params=params, headers=HEADERS, timeout=60)
+        resp.raise_for_status()
+        features = resp.json().get("features", [])
+        for f in features:
+            geom = f.get("geometry") or {}
+            coords = geom.get("coordinates") or []
+            if len(coords) < 2:
+                continue
+            p = f.get("properties") or {}
+            date_iso = time_str = None
+            if p.get("field_9"):
+                # UTCのエポックミリ秒 → 日本時間
+                dt = datetime.fromtimestamp(p["field_9"] / 1000, tz=timezone.utc).astimezone(JST)
+                date_iso, time_str = dt.strftime("%Y-%m-%d"), dt.strftime("%H:%M")
+            note_parts = [x for x in (p.get("field_4"), p.get("field_14"), p.get("field_11"), p.get("field_12")) if x]
+            results.append(
+                Sighting(
+                    prefecture="奈良県",
+                    city=p.get("field_6"),
+                    place=p.get("field_7"),
+                    date=date_iso,
+                    time=time_str,
+                    count=p.get("field_10") if isinstance(p.get("field_10"), int) else _parse_int(str(p.get("field_10") or "")),
+                    note=" / ".join(note_parts) or None,
+                    source="奈良県 ツキノワグマ目撃情報マップ (https://www.pref.nara.lg.jp/n118/p043003.html)",
+                    lon=float(coords[0]),
+                    lat=float(coords[1]),
+                )
+            )
+        if len(features) < 1000:
+            break
+        offset += 1000
+    return results
+
+
 def main() -> None:
     all_sightings: list[Sighting] = []
     fetchers = [
@@ -396,6 +501,8 @@ def main() -> None:
         ("滋賀県(高島市)", fetch_takashima),
         ("滋賀県(栗東市)", fetch_ritto),
         ("岐阜県", fetch_gifu),
+        ("山梨県", fetch_yamanashi),
+        ("奈良県", fetch_nara),
     ]
     for label, fn in fetchers:
         try:
