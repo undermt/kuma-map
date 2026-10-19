@@ -11,8 +11,12 @@ GitHub Pagesの /docs フォルダから配信し、Androidアプリ(WebView)は
 from __future__ import annotations
 
 import csv
+import html as html_lib
 import io
+import json
 import re
+import time
+import unicodedata
 import zipfile
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta, timezone
@@ -54,6 +58,23 @@ NARA_FEATURE_URL = (
     "https://pub-gis.nsa.pref.nara.jp/server/rest/services/Hosted/"
     "survey123_492ede82f5ae450ea7171fb986f04bd0/FeatureServer/0/query"
 )
+# 長野県: 県の月別目撃一覧PDF(市町村名まで)+市町の詳しい情報
+NAGANO_PREF_PAGE = "https://www.pref.nagano.lg.jp/shinrin/sangyo/ringyo/choju/joho/kuma-map.html"
+KARUIZAWA_URL = "http://www.thread.ne.jp/kta2/sarukuma.html"
+MATSUMOTO_CSV_URL = (
+    "https://docs.google.com/spreadsheets/d/e/2PACX-1vTlWZQfR-JuJJkjYnyTd1VBJfCDj_cSbbuHPu2lTOiqKuLRqk8rAbrYVvMWeYQXE-DBLirrZwbNATXl"
+    "/pub?output=csv"
+)
+AZUMINO_URL = "https://www.city.azumino.nagano.jp/site/kankyo-gomi/141946.html"
+# 県PDFのうち、市町独自の詳しい情報で取り込む市町は重複を避けるため除外する
+NAGANO_PDF_SKIP_CITIES = {"軽井沢町", "松本市", "安曇野市"}
+# 京都府: 府の地図は規約上自動取得できないため、市の公開情報を使う
+FUKUCHIYAMA_INDEX_URL = "https://www.city.fukuchiyama.lg.jp/soshiki/27/2615.html"
+NARA_KIZUGAWA_YAMAZOE_KML_URL = "https://www.google.com/maps/d/kml?mid=12y4Hw9PphxOJ0AbuPrQbHhQSDeIe1P4&forcekml=1"
+
+# 地名→座標の変換(国土地理院 住所検索API、無料・キー不要)。結果はファイルに残して再利用する
+GSI_GEOCODE_URL = "https://msearch.gsi.go.jp/address-search/AddressSearch"
+GEOCODE_CACHE_PATH = Path(__file__).resolve().parent / "geocode_cache.json"
 GIFU_CKAN_API = "https://gifu-opendata.pref.gifu.lg.jp/api/3/action/package_show?id=c11265-010"
 
 # 岐阜県オープンデータの平面直角座標系(第Ⅶ系, JGD2011)→ 緯度経度(JGD2011)変換
@@ -72,6 +93,7 @@ class Sighting:
     source: str
     lon: float
     lat: float
+    approx: bool = False  # True = 座標が公開されておらず、地名から位置を推定したもの
 
     def to_feature(self) -> dict:
         props = asdict(self)
@@ -493,6 +515,308 @@ def fetch_nara() -> list[Sighting]:
     return results
 
 
+_geocode_cache: dict | None = None
+
+
+def geocode(query: str) -> tuple[float, float] | None:
+    """地名(都道府県から始まる)を座標(経度, 緯度)に変換する。見つからなければNone"""
+    global _geocode_cache
+    if _geocode_cache is None:
+        _geocode_cache = (
+            json.loads(GEOCODE_CACHE_PATH.read_text(encoding="utf-8")) if GEOCODE_CACHE_PATH.exists() else {}
+        )
+    if query in _geocode_cache:
+        hit = _geocode_cache[query]
+        return (hit[0], hit[1]) if hit else None
+
+    resp = requests.get(GSI_GEOCODE_URL, params={"q": query}, headers=HEADERS, timeout=30)
+    resp.raise_for_status()
+    time.sleep(0.3)  # 国土地理院への負荷を抑える
+    pref_m = re.match(r"^(.+?[都道府県])(.+?[市町村])?", query)
+    prefix = (pref_m.group(1) + (pref_m.group(2) or "")) if pref_m else ""
+    hit = None
+    for item in resp.json():
+        title = item.get("properties", {}).get("title", "")
+        # 都道府県+市町村まで一致する候補だけ採用(同名の別地域を拾わないため)
+        if title.startswith(prefix):
+            hit = item["geometry"]["coordinates"][:2]
+            break
+    _geocode_cache[query] = hit
+    return (hit[0], hit[1]) if hit else None
+
+
+def save_geocode_cache() -> None:
+    if _geocode_cache is not None:
+        GEOCODE_CACHE_PATH.write_text(
+            json.dumps(_geocode_cache, ensure_ascii=False, indent=1, sort_keys=True), encoding="utf-8"
+        )
+
+
+def geocode_with_fallback(*queries: str) -> tuple[float, float] | None:
+    """詳しい地名から順に試し、見つかった最初の座標を返す"""
+    for q in queries:
+        if q:
+            hit = geocode(q)
+            if hit:
+                return hit
+    return None
+
+
+def _nfkc(text: str | None) -> str:
+    return unicodedata.normalize("NFKC", text or "").strip()
+
+
+def _infer_year(month: int) -> int:
+    """年が書かれていない月日について、今日から見て直近の年を返す"""
+    today = datetime.now(JST)
+    return today.year if month <= today.month else today.year - 1
+
+
+def _parse_jp_time(text: str) -> str | None:
+    """'午後5時30分頃' '22:15頃' '17時頃' などを 'HH:MM' に"""
+    text = _nfkc(text)
+    m = re.search(r"(午前|午後)?\s*(\d{1,2})時(?:(\d{1,2})分)?", text)
+    if m:
+        hour = int(m.group(2))
+        if m.group(1) == "午後" and hour < 12:
+            hour += 12
+        return f"{hour:02d}:{int(m.group(3) or 0):02d}"
+    m = re.search(r"(\d{1,2})[:：](\d{2})", text)
+    return f"{int(m.group(1)):02d}:{m.group(2)}" if m else None
+
+
+def fetch_nagano_pref_pdf() -> list[Sighting]:
+    from pypdf import PdfReader
+
+    page = requests.get(NAGANO_PREF_PAGE, headers=HEADERS, timeout=30)
+    page.raise_for_status()
+    page_text = page.content.decode("utf-8", errors="ignore")
+    today = datetime.now(JST)
+    fiscal_reiwa = (today.year if today.month >= 4 else today.year - 1) - 2018
+    links = []
+    for m in re.finditer(r'href="([^"]+mokugeki[^"]*\.pdf)"[^>]*>([^<]*)', page_text):
+        if f"令和{fiscal_reiwa}年" in _nfkc(m.group(2)):
+            links.append(requests.compat.urljoin(NAGANO_PREF_PAGE, m.group(1)))
+    if not links:
+        raise RuntimeError("今年度の月別PDFが見つかりません")
+
+    row_re = re.compile(
+        r"^\d+\s+(?P<date>\d{4}/\d{1,2}/\d{1,2})\s+(?P<city>\S+?[市町村])\s+(?P<area>\S+)\s+"
+        r"(?P<kind>目撃|痕跡)\s+(?P<size>\S+)\s+(?P<count>\S+)\s*(?P<status>.*)$"
+    )
+    results: list[Sighting] = []
+    for link in links:
+        resp = requests.get(link, headers=HEADERS, timeout=60)
+        resp.raise_for_status()
+        text = "\n".join(p.extract_text() or "" for p in PdfReader(io.BytesIO(resp.content)).pages)
+        for line in text.splitlines():
+            m = row_re.match(line.strip())
+            if not m or m.group("city") in NAGANO_PDF_SKIP_CITIES:
+                continue
+            pos = geocode(f"長野県{m.group('city')}")
+            if not pos:
+                continue
+            status = m.group("status").strip()
+            results.append(
+                Sighting(
+                    prefecture="長野県",
+                    city=m.group("city"),
+                    place=None,
+                    date=_slash_date_to_iso(m.group("date")),
+                    time=_parse_jp_time(status),
+                    count=_parse_int(_nfkc(m.group("count"))),
+                    note=" / ".join(x for x in (m.group("kind"), m.group("size"), m.group("area"), status) if x) or None,
+                    source="長野県 ツキノワグマ出没(目撃)情報 月別一覧 (https://www.pref.nagano.lg.jp/shinrin/sangyo/ringyo/choju/joho/kuma-map.html)",
+                    lon=pos[0],
+                    lat=pos[1],
+                    approx=True,
+                )
+            )
+    return results
+
+
+def fetch_karuizawa() -> list[Sighting]:
+    resp = requests.get(KARUIZAWA_URL, headers=HEADERS, timeout=30)
+    resp.raise_for_status()
+    page = resp.content.decode("utf-8", errors="ignore")
+    m = re.search(r"APP\.data\.information\s*=\s*(\[.*?\]);", page, re.S)
+    if not m:
+        raise RuntimeError("軽井沢町の地図データが見つかりません")
+    results: list[Sighting] = []
+    for item in json.loads(m.group(1)):
+        title = item.get("title", "")
+        if "クマ" not in title or item.get("latitude") is None:
+            continue
+        text = item.get("text", "")
+        results.append(
+            Sighting(
+                prefecture="長野県",
+                city="軽井沢町",
+                place=None,
+                date=_slash_date_to_iso(item.get("lastupdate")),
+                time=_parse_jp_time(text),
+                count=None,
+                note=" / ".join(x for x in (title, text) if x) or None,
+                source="軽井沢町 軽井沢さるクマ情報マップ (http://www.thread.ne.jp/kta2/sarukuma.html)",
+                lon=float(item["longitude"]),
+                lat=float(item["latitude"]),
+            )
+        )
+    return results
+
+
+def fetch_matsumoto() -> list[Sighting]:
+    resp = requests.get(MATSUMOTO_CSV_URL, headers=HEADERS, timeout=30)
+    resp.raise_for_status()
+    results: list[Sighting] = []
+    month = None
+    for row in csv.reader(io.StringIO(resp.content.decode("utf-8-sig"))):
+        cells = [_nfkc(c) for c in row] + ["", "", ""]
+        mm = re.match(r"^(\d{1,2})月", cells[0])
+        if mm:
+            month = int(mm.group(1))
+            continue
+        dm = re.match(r"^(\d{1,2})日", cells[0])
+        if not dm or month is None:
+            continue
+        place = cells[2]
+        area_m = re.match(r"(.+?)地区", place)
+        area = area_m.group(1).split("から")[0] if area_m else ""
+        pos = geocode_with_fallback(f"長野県松本市{area}" if area else "", "長野県松本市")
+        if not pos:
+            continue
+        results.append(
+            Sighting(
+                prefecture="長野県",
+                city="松本市",
+                place=place or None,
+                date=f"{_infer_year(month):04d}-{month:02d}-{int(dm.group(1)):02d}",
+                time=_parse_jp_time(cells[1]),
+                count=None,
+                note=None,
+                source="松本市 クマの目撃情報 (https://www.city.matsumoto.nagano.jp/soshiki/74/180997.html)",
+                lon=pos[0],
+                lat=pos[1],
+                approx=True,
+            )
+        )
+    return results
+
+
+def fetch_azumino() -> list[Sighting]:
+    resp = requests.get(AZUMINO_URL, headers=HEADERS, timeout=30)
+    resp.raise_for_status()
+    text = re.sub(r"<[^>]+>", "\n", resp.content.decode("utf-8", errors="ignore"))
+    line_re = re.compile(r"^(?P<month>\d{1,2})月(?P<day>\d{1,2})日\s+(?P<time>\S*?時\S*?)\s+(?P<rest>.+)$")
+    results: list[Sighting] = []
+    for raw in text.splitlines():
+        line = _nfkc(html_lib.unescape(raw))
+        m = line_re.match(line)
+        if not m:
+            continue
+        rest = m.group("rest")
+        area_m = re.match(r"(\S+?)地域[、,\s]*(.*)", rest)
+        area = area_m.group(1) if area_m else ""
+        pos = geocode_with_fallback(f"長野県安曇野市{area}" if area else "", "長野県安曇野市")
+        if not pos:
+            continue
+        month = int(m.group("month"))
+        results.append(
+            Sighting(
+                prefecture="長野県",
+                city="安曇野市",
+                place=rest,
+                date=f"{_infer_year(month):04d}-{month:02d}-{int(m.group('day')):02d}",
+                time=_parse_jp_time(m.group("time")),
+                count=None,
+                note=None,
+                source="安曇野市 ツキノワグマの目撃情報 (https://www.city.azumino.nagano.jp/site/kankyo-gomi/141946.html)",
+                lon=pos[0],
+                lat=pos[1],
+                approx=True,
+            )
+        )
+    return results
+
+
+def fetch_fukuchiyama() -> list[Sighting]:
+    index = requests.get(FUKUCHIYAMA_INDEX_URL, headers=HEADERS, timeout=30)
+    index.raise_for_status()
+    index_text = index.content.decode("utf-8", errors="ignore")
+    month_pages = sorted(set(re.findall(r'href="(/soshiki/27/\d+\.html)"[^>]*>[^<]*月目撃情報', index_text)))
+    results: list[Sighting] = []
+    for path in month_pages:
+        resp = requests.get(requests.compat.urljoin(FUKUCHIYAMA_INDEX_URL, path), headers=HEADERS, timeout=30)
+        resp.raise_for_status()
+        page = resp.content.decode("utf-8", errors="ignore")
+        title_m = re.search(r"<title>(.*?)</title>", page, re.S)
+        tm = re.search(r"令和(\d+)年(\d{1,2})月", _nfkc(title_m.group(1))) if title_m else None
+        if not tm:
+            continue
+        year, month = 2018 + int(tm.group(1)), int(tm.group(2))
+        for row in re.findall(r"<tr>(.*?)</tr>", page, re.S):
+            cells = [_nfkc(html_lib.unescape(re.sub(r"<[^>]+>", "", c))) for c in re.findall(r"<t[dh][^>]*>(.*?)</t[dh]>", row, re.S)]
+            if len(cells) < 2:
+                continue
+            dm = re.match(r"^(\d{1,2})日", cells[0])
+            if not dm:
+                continue
+            place = re.sub(r"\[PDF.*?\]", "", cells[1]).strip()
+            base = re.sub(r"[(（].*?[)）]", "", place).replace("字", "").strip()
+            pos = geocode_with_fallback(f"京都府{base}", "京都府福知山市")
+            if not pos:
+                continue
+            results.append(
+                Sighting(
+                    prefecture="京都府",
+                    city="福知山市",
+                    place=place.replace("福知山市", "", 1) or None,
+                    date=f"{year:04d}-{month:02d}-{int(dm.group(1)):02d}",
+                    time=None,
+                    count=None,
+                    note=None,
+                    source="福知山市 クマ目撃情報 (https://www.city.fukuchiyama.lg.jp/soshiki/27/2615.html)",
+                    lon=pos[0],
+                    lat=pos[1],
+                    approx=True,
+                )
+            )
+    return results
+
+
+def fetch_kizugawa() -> list[Sighting]:
+    resp = requests.get(NARA_KIZUGAWA_YAMAZOE_KML_URL, headers=HEADERS, timeout=30)
+    resp.raise_for_status()
+    root = ET.fromstring(resp.content)
+    results: list[Sighting] = []
+    for folder in root.iter(f"{KML_NS}Folder"):
+        if (folder.findtext(f"{KML_NS}name") or "").strip() != "木津川市":
+            continue  # 奈良市・山添村の分は奈良県の県データに含まれる
+        for placemark in folder.findall(f"{KML_NS}Placemark"):
+            parts = (placemark.findtext(f"{KML_NS}Point/{KML_NS}coordinates") or "").strip().split(",")
+            if len(parts) < 2:
+                continue
+            desc = re.sub(r"<br\s*/?>", "\n", placemark.findtext(f"{KML_NS}description") or "")
+            dm = re.search(r"目撃日[:：]\s*(\d{4}/\d{1,2}/\d{1,2})", desc)
+            sm = re.search(r"目撃(?:状況|情報)[:：]\s*(.+)", desc)
+            name = re.sub(r"^\d+\s*", "", (placemark.findtext(f"{KML_NS}name") or "").strip())
+            results.append(
+                Sighting(
+                    prefecture="京都府",
+                    city="木津川市",
+                    place=name or None,
+                    date=_slash_date_to_iso(dm.group(1)) if dm else None,
+                    time=None,
+                    count=None,
+                    note=sm.group(1).strip() if sm else None,
+                    source="奈良市・木津川市・山添村 クマ目撃情報マップ (https://www.city.nara.lg.jp/soshiki/110/264630.html)",
+                    lon=float(parts[0]),
+                    lat=float(parts[1]),
+                )
+            )
+    return results
+
+
 def main() -> None:
     all_sightings: list[Sighting] = []
     fetchers = [
@@ -503,6 +827,12 @@ def main() -> None:
         ("岐阜県", fetch_gifu),
         ("山梨県", fetch_yamanashi),
         ("奈良県", fetch_nara),
+        ("長野県(県の月別一覧)", fetch_nagano_pref_pdf),
+        ("長野県(軽井沢町)", fetch_karuizawa),
+        ("長野県(松本市)", fetch_matsumoto),
+        ("長野県(安曇野市)", fetch_azumino),
+        ("京都府(福知山市)", fetch_fukuchiyama),
+        ("京都府(木津川市)", fetch_kizugawa),
     ]
     for label, fn in fetchers:
         try:
@@ -511,6 +841,7 @@ def main() -> None:
             all_sightings.extend(items)
         except Exception as e:  # noqa: BLE001
             print(f"[ERROR] {label}: 取得に失敗しました -> {e}")
+    save_geocode_cache()
 
     feature_collection = {
         "type": "FeatureCollection",
